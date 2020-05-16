@@ -12,6 +12,7 @@ import (
 
 	"github.com/applepi-icpc/stbank/aesrw"
 	"github.com/billziss-gh/cgofuse/fuse"
+	"github.com/ricochet2200/go-disk-usage/du"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -62,8 +63,16 @@ func (node *Node) IsLink() bool {
 	return node.Stat.Mode&fuse.S_IFMT == fuse.S_IFLNK
 }
 
+const (
+	TotalFiles    = 1000000000
+	FileBlockSize = 1024
+	NameMax       = 255
+)
+
 type AESFSMeta struct {
-	CurrentIno NodeID `json:"c"`
+	CurrentIno  NodeID `json:"c"`
+	TotalBlocks uint64 `json:"tb"`
+	TotalFiles  uint64 `json:"tf"`
 }
 
 type AESFS struct {
@@ -285,7 +294,13 @@ func NewAESFS(rootDir string, blockEncryption cipher.Block) (*AESFS, error) {
 	if _, err := os.Stat(res.actualPath("meta")); os.IsNotExist(err) {
 		// make a totally new file system
 		res.meta = &AESFSMeta{
-			CurrentIno: ROOT_INO + 1,
+			CurrentIno:  ROOT_INO + 1,
+			TotalBlocks: 0,
+			TotalFiles:  0,
+		}
+		err = res.dumpMeta()
+		if err != nil {
+			return nil, err
 		}
 
 		// make root inode
@@ -347,7 +362,7 @@ func (fs *AESFS) lookupNode(path string, ancestor NodeID) (parent NodeID, name s
 		if c == "" {
 			continue
 		}
-		if len(c) > 255 {
+		if len(c) > NameMax {
 			errno = -fuse.ENAMETOOLONG
 			return
 		}
@@ -412,6 +427,11 @@ func (fs *AESFS) makeNode(path string, mode uint32, dev uint64, data []byte) (er
 
 		newIno = fs.meta.CurrentIno
 		fs.meta.CurrentIno += 1
+		fs.meta.TotalFiles += 1
+		if data != nil {
+			fs.meta.TotalBlocks += uint64(len(data) / FileBlockSize)
+		}
+
 		err = fs.dumpMeta()
 	}()
 	if err != nil {
@@ -468,12 +488,14 @@ func (fs *AESFS) removeNode(path string, dir bool) (errno int, err error) {
 	}
 
 	now := fuse.Now()
+	removed := false
 
 	nodeObject.Stat.Nlink -= 1
 	if nodeObject.Stat.Nlink == 0 {
 		// TODO: race condition
 		os.Remove(fs.inoPath(node, "c"))
 		os.Remove(fs.inoPath(node, "i"))
+		removed = true
 	} else {
 		nodeObject.Stat.Ctim = now
 		err = fs.dumpNode(node, nodeObject)
@@ -494,6 +516,20 @@ func (fs *AESFS) removeNode(path string, dir bool) (errno int, err error) {
 	err = fs.dumpNode(parent, parentObject)
 	if err != nil {
 		return
+	}
+
+	if removed {
+		func() {
+			fs.mu.Lock()
+			defer fs.mu.Unlock()
+
+			fs.meta.TotalFiles -= 1
+			fs.meta.TotalBlocks -= uint64(nodeObject.Stat.Size / FileBlockSize)
+			err = fs.dumpMeta()
+		}()
+		if err != nil {
+			return
+		}
 	}
 
 	return
@@ -556,6 +592,30 @@ func (fs *AESFS) closeNode(fh uint64) {
 	} else {
 		fs.opencount[nodeID] = cnt - 1
 	}
+}
+
+func (fs *AESFS) Statfs(path string, stat *fuse.Statfs_t) (errno int) {
+	var err error
+	defer Trace(path)(&err, &errno)
+
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	usage := du.NewDiskUsage(fs.rootDir)
+	freeBytes := usage.Free()
+	freeBlocks := freeBytes / FileBlockSize
+
+	stat.Bsize = FileBlockSize
+	stat.Frsize = FileBlockSize
+	stat.Blocks = freeBlocks + fs.meta.TotalBlocks
+	stat.Bfree = freeBlocks
+	stat.Bavail = freeBlocks
+	stat.Files = fs.meta.TotalFiles
+	stat.Ffree = TotalFiles - uint64(fs.meta.TotalFiles)
+	stat.Favail = TotalFiles - uint64(fs.meta.TotalFiles)
+	stat.Namemax = NameMax
+
+	return
 }
 
 func (fs *AESFS) Mknod(path string, mode uint32, dev uint64) (errno int) {
@@ -764,11 +824,14 @@ func (fs *AESFS) Rename(oldpath string, newpath string) (errno int) {
 		errno = -fuse.EIO
 		return
 	}
-
-	newParentNodeObject, err = fs.getNode(newParentNode)
-	if err != nil {
-		errno = -fuse.EIO
-		return
+	if newParentNode != oldParentNode {
+		newParentNodeObject, err = fs.getNode(newParentNode)
+		if err != nil {
+			errno = -fuse.EIO
+			return
+		}
+	} else {
+		newParentNodeObject = oldParentNodeObject
 	}
 
 	// actual modification
@@ -781,10 +844,12 @@ func (fs *AESFS) Rename(oldpath string, newpath string) (errno int) {
 		errno = -fuse.EIO
 		return
 	}
-	err = fs.dumpNode(newParentNode, newParentNodeObject)
-	if err != nil {
-		errno = -fuse.EIO
-		return
+	if oldParentNode != newParentNode {
+		err = fs.dumpNode(newParentNode, newParentNodeObject)
+		if err != nil {
+			errno = -fuse.EIO
+			return
+		}
 	}
 
 	return
@@ -957,6 +1022,7 @@ func (fs *AESFS) Truncate(path string, size int64, fh uint64) (errno int) {
 		return
 	}
 
+	oldSize := nodeObject.Stat.Size
 	nodeObject.Stat.Size = size
 	now := fuse.Now()
 	nodeObject.Stat.Ctim = now
@@ -967,6 +1033,25 @@ func (fs *AESFS) Truncate(path string, size int64, fh uint64) (errno int) {
 	if err != nil {
 		errno = -fuse.EIO
 		return
+	}
+
+	// modify meta
+	oldBlocks := oldSize / FileBlockSize
+	newBlocks := size / FileBlockSize
+	if oldBlocks != newBlocks {
+		func() {
+			fs.mu.Lock()
+			defer fs.mu.Unlock()
+
+			fs.meta.TotalBlocks += uint64(newBlocks)
+			fs.meta.TotalBlocks -= uint64(oldBlocks)
+
+			err = fs.dumpMeta()
+		}()
+		if err != nil {
+			errno = -fuse.EIO
+			return
+		}
 	}
 
 	return
@@ -1051,12 +1136,32 @@ func (fs *AESFS) Write(path string, buffer []byte, offset int64, fh uint64) (n i
 
 	endOffset := offset + int64(len(buffer))
 	if endOffset > nodeObject.Stat.Size {
+		oldSize := nodeObject.Stat.Size
 		nodeObject.Stat.Size = endOffset
 
 		err = af.Truncate(endOffset)
 		if err != nil {
 			n = -fuse.EIO
 			return
+		}
+
+		// modify meta
+		oldBlocks := oldSize / FileBlockSize
+		newBlocks := endOffset / FileBlockSize
+		if oldBlocks != newBlocks {
+			func() {
+				fs.mu.Lock()
+				defer fs.mu.Unlock()
+
+				fs.meta.TotalBlocks += uint64(newBlocks)
+				fs.meta.TotalBlocks -= uint64(oldBlocks)
+
+				err = fs.dumpMeta()
+			}()
+			if err != nil {
+				n = -fuse.EIO
+				return
+			}
 		}
 	}
 
@@ -1127,6 +1232,8 @@ func (fs *AESFS) Readdir(path string, fill Filler, offset int64, fh uint64) (err
 		if !fill(name, &childNode.Stat, 0) {
 			break
 		}
+
+		log.Infof("Readdir(%s, %d, %d): %s", path, offset, fh, name)
 	}
 
 	return

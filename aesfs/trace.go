@@ -94,12 +94,15 @@ func Trace(params ...interface{}) func(vals ...interface{}) {
 	funcName := "<UNKNOWN>"
 	if ok {
 		fn := runtime.FuncForPC(pc)
-		funcName = fn.Name()
+		rawFuncName := fn.Name()
+		parts := strings.Split(rawFuncName, ".")
+		funcName = parts[len(parts)-1]
 	}
 
 	uid, gid, _ := fuse.Getcontext()
-	prefix := fmt.Sprintf("[u=%d, g=%d]", uid, gid)
+	prefix := fmt.Sprintf("[u=%d,g=%d]", uid, gid)
 	args := traceJoin(false, params)
+
 	return func(vals ...interface{}) {
 		result := ""
 		recovered := recover()

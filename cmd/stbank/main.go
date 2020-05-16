@@ -30,7 +30,7 @@ func main() {
 		password = args[len(args)-2]
 		args = append(args[:len(args)-3], args[len(args)-1])
 	} else {
-		log.Fatalf("Usage: ./%s [options] <root> <password> <mountpoint>", args[0])
+		log.Fatalf("Usage: %s [options] <root> <password> <mountpoint>", args[0])
 	}
 
 	passwordSHA256 := sha256.Sum256([]byte(password))
