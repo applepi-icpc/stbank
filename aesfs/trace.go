@@ -103,6 +103,8 @@ func Trace(params ...interface{}) func(vals ...interface{}) {
 	prefix := fmt.Sprintf("[u=%d,g=%d]", uid, gid)
 	args := traceJoin(false, params)
 
+	// log.Infof("%v I %v(%v)", prefix, funcName, args)
+
 	return func(vals ...interface{}) {
 		result := ""
 		recovered := recover()

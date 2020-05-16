@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/applepi-icpc/stbank/aesrw"
 	"github.com/billziss-gh/cgofuse/fuse"
@@ -75,6 +78,16 @@ type AESFSMeta struct {
 	TotalFiles  uint64 `json:"tf"`
 }
 
+type NodeCache struct {
+	ID        NodeID
+	Node      *Node
+	Dirty     bool
+	LastTouch time.Time
+	Occupied  bool
+}
+
+const CacheSize = 32
+
 type AESFS struct {
 	fuse.FileSystemBase
 	mu sync.Mutex
@@ -85,6 +98,12 @@ type AESFS struct {
 
 	openmap   map[NodeID]*Node
 	opencount map[NodeID]int
+
+	metaShouldDump bool
+	metaDumpTime   time.Time
+
+	nodeCacheMu sync.Mutex
+	nodeCache   []*NodeCache
 }
 
 func (fs *AESFS) actualPath(filename string) string {
@@ -250,6 +269,46 @@ func (fs *AESFS) dumpMeta() error {
 	return err
 }
 
+func (fs *AESFS) scheduleMetaDump() {
+	// no lock
+
+	if !fs.metaShouldDump {
+		fs.metaShouldDump = true
+		fs.metaDumpTime = time.Now().Add(time.Second * 30)
+	}
+}
+
+func (fs *AESFS) _checkMetaDump() {
+	if fs.metaShouldDump {
+		err := fs.dumpMeta()
+		if err != nil {
+			log.WithError(err).Error("Failed to dump meta")
+		} else {
+			log.Info("Meta dumped")
+			fs.metaShouldDump = false
+		}
+	}
+}
+
+func (fs *AESFS) checkMetaDump() {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	fs._checkMetaDump()
+}
+
+func (fs *AESFS) checkMetaDumpLoop() {
+	for {
+		time.Sleep(time.Second)
+		now := time.Now()
+		fs.mu.Lock()
+		if fs.metaDumpTime.Before(now) {
+			fs._checkMetaDump()
+		}
+		fs.mu.Unlock()
+	}
+}
+
 func (fs *AESFS) readNode(ino NodeID) (*Node, error) {
 	// low level node read API, use getNode instead
 
@@ -316,12 +375,140 @@ func NewAESFS(rootDir string, blockEncryption cipher.Block) (*AESFS, error) {
 		}
 	}
 
+	go res.checkMetaDumpLoop()
+
+	res.nodeCache = make([]*NodeCache, CacheSize)
+	for k := range res.nodeCache {
+		res.nodeCache[k] = &NodeCache{}
+	}
+
+	go res.scanCacheLoop()
+
+	sig := make(chan os.Signal)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		_, ok := <-sig
+		if ok {
+			res.exitSignalHandler()
+		}
+	}()
+
 	return res, nil
 }
 
-func (fs *AESFS) getNode(ino NodeID) (*Node, error) {
-	// TODO: add cache
+func (fs *AESFS) exitSignalHandler() {
+	fs.checkMetaDump()
 
+	fs.nodeCacheMu.Lock()
+	defer fs.nodeCacheMu.Unlock()
+
+	for _, entry := range fs.nodeCache {
+		if entry.Occupied && entry.Dirty {
+			fs.writeBackNode(entry)
+		}
+	}
+}
+
+func (fs *AESFS) findInCache(ino NodeID) *Node {
+	fs.nodeCacheMu.Lock()
+	defer fs.nodeCacheMu.Unlock()
+
+	for _, entry := range fs.nodeCache {
+		if entry.Occupied && entry.ID == ino {
+			entry.LastTouch = time.Now()
+			return entry.Node
+		}
+	}
+
+	return nil
+}
+
+func (fs *AESFS) writeBackNode(entry *NodeCache) {
+	// no lock
+
+	err := fs.dumpNode(entry.ID, entry.Node)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"error": err,
+			"id":    entry.ID,
+		}).Error("Failed to dump node")
+	} else {
+		log.WithField("id", entry.ID).Info("Node wrote back")
+		entry.Dirty = false
+	}
+}
+
+func (fs *AESFS) findEmptyEntry() (index int) {
+	// no lock
+
+	index = -1
+	earliestLastTouch := time.Now()
+
+	for i, entry := range fs.nodeCache {
+		if !entry.Occupied {
+			return i
+		}
+		if entry.LastTouch.Before(earliestLastTouch) {
+			earliestLastTouch = entry.LastTouch
+			index = i
+		}
+	}
+
+	if index == -1 {
+		panic("not evicted anything")
+	}
+	entry := fs.nodeCache[index]
+	if entry.Dirty {
+		fs.writeBackNode(entry)
+	}
+
+	return
+}
+
+func (fs *AESFS) writeToCache(ino NodeID, node *Node, dirty bool) {
+	fs.nodeCacheMu.Lock()
+	defer fs.nodeCacheMu.Unlock()
+
+	for _, entry := range fs.nodeCache {
+		if entry.Occupied && entry.ID == ino {
+			entry.Node = node
+			entry.Dirty = dirty
+			entry.LastTouch = time.Now()
+			return
+		}
+	}
+
+	index := fs.findEmptyEntry()
+
+	entry := fs.nodeCache[index]
+	entry.ID = ino
+	entry.Node = node
+	entry.Dirty = true
+	entry.LastTouch = time.Now()
+	entry.Occupied = true
+}
+
+func (fs *AESFS) scanCacheLoop() {
+	for {
+		time.Sleep(time.Second)
+
+		func() {
+			bar := time.Now().Add(-time.Second * 5)
+
+			fs.nodeCacheMu.Lock()
+			defer fs.nodeCacheMu.Unlock()
+
+			for _, entry := range fs.nodeCache {
+				if entry.Occupied && entry.Dirty && entry.LastTouch.Before(bar) {
+					fs.writeBackNode(entry)
+				}
+			}
+		}()
+	}
+}
+
+func (fs *AESFS) getNode(ino NodeID) (*Node, error) {
 	fs.mu.Lock()
 	node, exist := fs.openmap[ino]
 	if exist {
@@ -330,7 +517,18 @@ func (fs *AESFS) getNode(ino NodeID) (*Node, error) {
 	}
 	fs.mu.Unlock()
 
-	return fs.readNode(ino)
+	cachedNode := fs.findInCache(ino)
+	if cachedNode != nil {
+		return cachedNode, nil
+	}
+
+	node, err := fs.readNode(ino)
+	if err != nil {
+		return nil, err
+	}
+
+	fs.writeToCache(ino, node, false)
+	return node, nil
 }
 
 func (fs *AESFS) getNodeByPath(path string, fh uint64) (node NodeID, nodeObject *Node, errno int, err error) {
@@ -432,11 +630,8 @@ func (fs *AESFS) makeNode(path string, mode uint32, dev uint64, data []byte) (er
 			fs.meta.TotalBlocks += uint64(len(data) / FileBlockSize)
 		}
 
-		err = fs.dumpMeta()
+		fs.scheduleMetaDump()
 	}()
-	if err != nil {
-		return
-	}
 
 	uid, gid, _ := fuse.Getcontext()
 	newNode := NewNode(dev, uint64(newIno), mode, uid, gid)
@@ -449,18 +644,12 @@ func (fs *AESFS) makeNode(path string, mode uint32, dev uint64, data []byte) (er
 		newNode.Stat.Size = int64(len(data))
 	}
 
-	err = fs.dumpNode(newIno, newNode)
-	if err != nil {
-		return
-	}
+	fs.writeToCache(newIno, newNode, true)
 
 	parentObject.Children[name] = newIno
 	parentObject.Stat.Ctim = newNode.Stat.Ctim
 	parentObject.Stat.Mtim = newNode.Stat.Ctim
-	err = fs.dumpNode(parent, parentObject)
-	if err != nil {
-		return
-	}
+	fs.writeToCache(parent, parentObject, true)
 
 	return
 }
@@ -498,10 +687,7 @@ func (fs *AESFS) removeNode(path string, dir bool) (errno int, err error) {
 		removed = true
 	} else {
 		nodeObject.Stat.Ctim = now
-		err = fs.dumpNode(node, nodeObject)
-		if err != nil {
-			return
-		}
+		fs.writeToCache(node, nodeObject, true)
 	}
 
 	var parentObject *Node
@@ -513,10 +699,7 @@ func (fs *AESFS) removeNode(path string, dir bool) (errno int, err error) {
 	delete(parentObject.Children, name)
 	parentObject.Stat.Ctim = now
 	parentObject.Stat.Mtim = now
-	err = fs.dumpNode(parent, parentObject)
-	if err != nil {
-		return
-	}
+	fs.writeToCache(parent, parentObject, true)
 
 	if removed {
 		func() {
@@ -525,11 +708,8 @@ func (fs *AESFS) removeNode(path string, dir bool) (errno int, err error) {
 
 			fs.meta.TotalFiles -= 1
 			fs.meta.TotalBlocks -= uint64(nodeObject.Stat.Size / FileBlockSize)
-			err = fs.dumpMeta()
+			fs.scheduleMetaDump()
 		}()
-		if err != nil {
-			return
-		}
 	}
 
 	return
@@ -711,16 +891,8 @@ func (fs *AESFS) Link(oldpath string, newpath string) (errno int) {
 	newParentNodeObject.Stat.Mtim = now
 
 	// dump
-	err = fs.dumpNode(oldNode, oldNodeObject)
-	if err != nil {
-		errno = -fuse.EIO
-		return
-	}
-	err = fs.dumpNode(newParentNode, newParentNodeObject)
-	if err != nil {
-		errno = -fuse.EIO
-		return
-	}
+	fs.writeToCache(oldNode, oldNodeObject, true)
+	fs.writeToCache(newParentNode, newParentNodeObject, true)
 
 	return
 }
@@ -839,17 +1011,9 @@ func (fs *AESFS) Rename(oldpath string, newpath string) (errno int) {
 	newParentNodeObject.Children[newName] = oldNode
 
 	// dump
-	err = fs.dumpNode(oldParentNode, oldParentNodeObject)
-	if err != nil {
-		errno = -fuse.EIO
-		return
-	}
+	fs.writeToCache(oldParentNode, oldParentNodeObject, true)
 	if oldParentNode != newParentNode {
-		err = fs.dumpNode(newParentNode, newParentNodeObject)
-		if err != nil {
-			errno = -fuse.EIO
-			return
-		}
+		fs.writeToCache(newParentNode, newParentNodeObject, true)
 	}
 
 	return
@@ -879,11 +1043,7 @@ func (fs *AESFS) Chmod(path string, mode uint32) (errno int) {
 	nodeObject.Stat.Ctim = fuse.Now()
 
 	// dump
-	err = fs.dumpNode(node, nodeObject)
-	if err != nil {
-		errno = -fuse.EIO
-		return
-	}
+	fs.writeToCache(node, nodeObject, true)
 
 	return
 }
@@ -917,11 +1077,7 @@ func (fs *AESFS) Chown(path string, uid uint32, gid uint32) (errno int) {
 	nodeObject.Stat.Ctim = fuse.Now()
 
 	// dump
-	err = fs.dumpNode(node, nodeObject)
-	if err != nil {
-		errno = -fuse.EIO
-		return
-	}
+	fs.writeToCache(node, nodeObject, true)
 
 	return
 }
@@ -955,11 +1111,7 @@ func (fs *AESFS) Utimens(path string, timestamp []fuse.Timespec) (errno int) {
 	nodeObject.Stat.Mtim = timestamp[1]
 
 	// dump
-	err = fs.dumpNode(node, nodeObject)
-	if err != nil {
-		errno = -fuse.EIO
-		return
-	}
+	fs.writeToCache(node, nodeObject, true)
 
 	return
 }
@@ -1029,11 +1181,7 @@ func (fs *AESFS) Truncate(path string, size int64, fh uint64) (errno int) {
 	nodeObject.Stat.Mtim = now
 
 	// dump
-	err = fs.dumpNode(node, nodeObject)
-	if err != nil {
-		errno = -fuse.EIO
-		return
-	}
+	fs.writeToCache(node, nodeObject, true)
 
 	// modify meta
 	oldBlocks := oldSize / FileBlockSize
@@ -1046,12 +1194,8 @@ func (fs *AESFS) Truncate(path string, size int64, fh uint64) (errno int) {
 			fs.meta.TotalBlocks += uint64(newBlocks)
 			fs.meta.TotalBlocks -= uint64(oldBlocks)
 
-			err = fs.dumpMeta()
+			fs.scheduleMetaDump()
 		}()
-		if err != nil {
-			errno = -fuse.EIO
-			return
-		}
 	}
 
 	return
@@ -1101,11 +1245,7 @@ func (fs *AESFS) Read(path string, buffer []byte, offset int64, fh uint64) (n in
 	nodeObject.Stat.Atim = now
 
 	// dump
-	err = fs.dumpNode(node, nodeObject)
-	if err != nil {
-		n = -fuse.EIO
-		return
-	}
+	fs.writeToCache(node, nodeObject, true)
 
 	return
 }
@@ -1156,12 +1296,8 @@ func (fs *AESFS) Write(path string, buffer []byte, offset int64, fh uint64) (n i
 				fs.meta.TotalBlocks += uint64(newBlocks)
 				fs.meta.TotalBlocks -= uint64(oldBlocks)
 
-				err = fs.dumpMeta()
+				fs.scheduleMetaDump()
 			}()
-			if err != nil {
-				n = -fuse.EIO
-				return
-			}
 		}
 	}
 
@@ -1176,11 +1312,7 @@ func (fs *AESFS) Write(path string, buffer []byte, offset int64, fh uint64) (n i
 	nodeObject.Stat.Mtim = now
 
 	// dump
-	err = fs.dumpNode(node, nodeObject)
-	if err != nil {
-		n = -fuse.EIO
-		return
-	}
+	fs.writeToCache(node, nodeObject, true)
 
 	return
 }
@@ -1287,11 +1419,7 @@ func (fs *AESFS) Setxattr(path string, name string, value []byte, flags int) (er
 	nodeObject.XAttr[name] = xattr
 
 	// dump
-	err = fs.dumpNode(node, nodeObject)
-	if err != nil {
-		errno = -fuse.EIO
-		return
-	}
+	fs.writeToCache(node, nodeObject, true)
 
 	return
 }
@@ -1364,11 +1492,7 @@ func (fs *AESFS) Removexattr(path string, name string) (errno int) {
 	delete(nodeObject.XAttr, name)
 
 	// dump
-	err = fs.dumpNode(node, nodeObject)
-	if err != nil {
-		errno = -fuse.EIO
-		return
-	}
+	fs.writeToCache(node, nodeObject, true)
 
 	return
 }
@@ -1427,11 +1551,7 @@ func (fs *AESFS) Chflags(path string, flags uint32) (errno int) {
 	nodeObject.Stat.Ctim = fuse.Now()
 
 	// dump
-	err = fs.dumpNode(node, nodeObject)
-	if err != nil {
-		errno = -fuse.EIO
-		return
-	}
+	fs.writeToCache(node, nodeObject, true)
 
 	return
 }
@@ -1460,11 +1580,7 @@ func (fs *AESFS) Setcrtime(path string, timestamp fuse.Timespec) (errno int) {
 	nodeObject.Stat.Ctim = fuse.Now()
 
 	// dump
-	err = fs.dumpNode(node, nodeObject)
-	if err != nil {
-		errno = -fuse.EIO
-		return
-	}
+	fs.writeToCache(node, nodeObject, true)
 
 	return
 }
@@ -1492,11 +1608,7 @@ func (fs *AESFS) Setchgtime(path string, timestamp fuse.Timespec) (errno int) {
 	nodeObject.Stat.Ctim = timestamp
 
 	// dump
-	err = fs.dumpNode(node, nodeObject)
-	if err != nil {
-		errno = -fuse.EIO
-		return
-	}
+	fs.writeToCache(node, nodeObject, true)
 
 	return
 }

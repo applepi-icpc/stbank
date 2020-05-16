@@ -12,7 +12,7 @@ import (
 )
 
 func main() {
-	// Usage: ./stbank [options] <root> <password> <mountpoint>
+	// Usage: ./stbank <root> <password> [options] <mountpoint>
 
 	args := os.Args
 	var (
@@ -21,16 +21,16 @@ func main() {
 		err      error
 	)
 
-	if len(args) >= 4 && args[len(args)-3][0] != '-' && args[len(args)-2][0] != '-' && args[len(args)-1][0] != '-' {
-		rawRoot := args[len(args)-3]
+	if len(args) >= 4 && args[1][0] != '-' && args[2][0] != '-' && args[len(args)-1][0] != '-' {
+		rawRoot := args[1]
 		root, err = filepath.Abs(rawRoot)
 		if err != nil {
 			log.Fatal("Failed to get path from %s: %s", rawRoot, err.Error())
 		}
-		password = args[len(args)-2]
-		args = append(args[:len(args)-3], args[len(args)-1])
+		password = args[2]
+		args = append(args[3:])
 	} else {
-		log.Fatalf("Usage: %s [options] <root> <password> <mountpoint>", args[0])
+		log.Fatalf("Usage: %s <root> <password> [options] <mountpoint>", args[0])
 	}
 
 	passwordSHA256 := sha256.Sum256([]byte(password))
@@ -46,5 +46,5 @@ func main() {
 	}
 
 	host := fuse.NewFileSystemHost(fs)
-	host.Mount("", args[1:])
+	host.Mount("", args)
 }
