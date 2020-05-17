@@ -143,6 +143,10 @@ func (f *AESFile) Truncate(size int64) error {
 	return nil
 }
 
+func (f *AESFile) TruncateFillZero(size int64) error {
+	return f.underlying.Truncate(size + int64(BlockSize))
+}
+
 func (f *AESFile) Size() (int64, error) {
 	originalSize, err := f.underlying.Size()
 	if err != nil {

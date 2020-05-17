@@ -96,8 +96,9 @@ type AESFS struct {
 	meta            *AESFSMeta
 	rootDir         string // root dir on actual file system
 
-	openmap   map[NodeID]*Node
-	opencount map[NodeID]int
+	openmap     map[NodeID]*Node
+	opencount   map[NodeID]int
+	openedFiles map[NodeID]*aesrw.AESFile
 
 	metaShouldDump bool
 	metaDumpTime   time.Time
@@ -140,7 +141,7 @@ const (
 	CREATE_NO
 )
 
-func (fs *AESFS) openActualFile(path string, createFlag CreateFlag, withdrawFailOK bool) (aesrw.File, error) {
+func (fs *AESFS) openActualFile(path string, createFlag CreateFlag, withdrawFailOK bool) (*aesrw.AESFile, error) {
 	ensureActualDir(path)
 
 	var create bool
@@ -349,6 +350,7 @@ func NewAESFS(rootDir string, blockEncryption cipher.Block) (*AESFS, error) {
 		rootDir:         rootDir,
 		openmap:         make(map[int64]*Node),
 		opencount:       make(map[int64]int),
+		openedFiles:     make(map[int64]*aesrw.AESFile),
 	}
 	if _, err := os.Stat(res.actualPath("meta")); os.IsNotExist(err) {
 		// make a totally new file system
@@ -744,12 +746,23 @@ func (fs *AESFS) openNode(path string, dir bool) (errno int, err error, fh uint6
 
 		cnt, exist := fs.opencount[node]
 		if !exist {
+			var af *aesrw.AESFile
+			af, err = fs.openActualFile(fs.inoPath(node, "c"), CREATE_AUTO, false)
+			if err != nil {
+				return
+			}
+
 			fs.opencount[node] = 1
 			fs.openmap[node] = nodeObject
+			fs.openedFiles[node] = af
 		} else {
 			fs.opencount[node] = cnt + 1
 		}
 	}()
+
+	if err != nil {
+		errno = -fuse.EIO
+	}
 
 	fh = uint64(node)
 	return
@@ -769,6 +782,16 @@ func (fs *AESFS) closeNode(fh uint64) {
 		// remove node
 		delete(fs.opencount, nodeID)
 		delete(fs.openmap, nodeID)
+
+		err := fs.openedFiles[nodeID].Close()
+		if err != nil {
+			log.WithFields(log.Fields{
+				"error":   err,
+				"node_id": nodeID,
+			}).Error("Failed to close content file")
+		}
+
+		delete(fs.openedFiles, nodeID)
 	} else {
 		fs.opencount[nodeID] = cnt - 1
 	}
@@ -1227,13 +1250,22 @@ func (fs *AESFS) Read(path string, buffer []byte, offset int64, fh uint64) (n in
 		return
 	}
 
-	var af aesrw.File
-	af, err = fs.openActualFile(fs.inoPath(node, "c"), CREATE_AUTO, false)
-	if err != nil {
-		n = -fuse.EIO
-		return
+	var (
+		af    aesrw.File
+		exist bool
+	)
+	fs.mu.Lock()
+	af, exist = fs.openedFiles[node]
+	fs.mu.Unlock()
+
+	if !exist {
+		af, err = fs.openActualFile(fs.inoPath(node, "c"), CREATE_AUTO, false)
+		if err != nil {
+			n = -fuse.EIO
+			return
+		}
+		defer af.Close()
 	}
-	defer af.Close()
 
 	n, err = af.ReadAt(buffer[:readLength], offset)
 	if err != nil {
@@ -1266,20 +1298,33 @@ func (fs *AESFS) Write(path string, buffer []byte, offset int64, fh uint64) (n i
 		return
 	}
 
-	var af aesrw.File
-	af, err = fs.openActualFile(fs.inoPath(node, "c"), CREATE_AUTO, false)
-	if err != nil {
-		n = -fuse.EIO
-		return
+	var (
+		af    *aesrw.AESFile
+		exist bool
+	)
+	fs.mu.Lock()
+	af, exist = fs.openedFiles[node]
+	fs.mu.Unlock()
+
+	if !exist {
+		af, err = fs.openActualFile(fs.inoPath(node, "c"), CREATE_AUTO, false)
+		if err != nil {
+			n = -fuse.EIO
+			return
+		}
+		defer af.Close()
 	}
-	defer af.Close()
 
 	endOffset := offset + int64(len(buffer))
 	if endOffset > nodeObject.Stat.Size {
 		oldSize := nodeObject.Stat.Size
 		nodeObject.Stat.Size = endOffset
 
-		err = af.Truncate(endOffset)
+		if oldSize < offset {
+			err = af.Truncate(endOffset)
+		} else {
+			err = af.TruncateFillZero(endOffset)
+		}
 		if err != nil {
 			n = -fuse.EIO
 			return
