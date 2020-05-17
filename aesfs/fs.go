@@ -484,7 +484,7 @@ func (fs *AESFS) writeToCache(ino NodeID, node *Node, dirty bool) {
 	entry := fs.nodeCache[index]
 	entry.ID = ino
 	entry.Node = node
-	entry.Dirty = true
+	entry.Dirty = dirty
 	entry.LastTouch = time.Now()
 	entry.Occupied = true
 }
@@ -1241,11 +1241,11 @@ func (fs *AESFS) Read(path string, buffer []byte, offset int64, fh uint64) (n in
 		return
 	}
 
-	now := fuse.Now()
-	nodeObject.Stat.Atim = now
+	// now := fuse.Now()
+	// nodeObject.Stat.Atim = now
 
 	// dump
-	fs.writeToCache(node, nodeObject, true)
+	// fs.writeToCache(node, nodeObject, true)
 
 	return
 }
@@ -1364,8 +1364,6 @@ func (fs *AESFS) Readdir(path string, fill Filler, offset int64, fh uint64) (err
 		if !fill(name, &childNode.Stat, 0) {
 			break
 		}
-
-		log.Infof("Readdir(%s, %d, %d): %s", path, offset, fh, name)
 	}
 
 	return
@@ -1380,152 +1378,152 @@ func (fs *AESFS) Releasedir(path string, fh uint64) (errno int) {
 	return
 }
 
-func (fs *AESFS) Setxattr(path string, name string, value []byte, flags int) (errno int) {
-	var err error
-	defer Trace(path, name, value, flags)(&err, &errno)
+// func (fs *AESFS) Setxattr(path string, name string, value []byte, flags int) (errno int) {
+// 	var err error
+// 	defer Trace(path, name, value, flags)(&err, &errno)
 
-	var (
-		node       NodeID
-		nodeObject *Node
-	)
-	_, _, node, nodeObject, errno, err = fs.lookupNode(path, INVALID_INO)
-	if errno < 0 || err != nil {
-		if err != nil {
-			errno = -fuse.EIO
-		}
-		return
-	}
-	if node == INVALID_INO {
-		errno = -fuse.ENOENT
-		return
-	}
+// 	var (
+// 		node       NodeID
+// 		nodeObject *Node
+// 	)
+// 	_, _, node, nodeObject, errno, err = fs.lookupNode(path, INVALID_INO)
+// 	if errno < 0 || err != nil {
+// 		if err != nil {
+// 			errno = -fuse.EIO
+// 		}
+// 		return
+// 	}
+// 	if node == INVALID_INO {
+// 		errno = -fuse.ENOENT
+// 		return
+// 	}
 
-	if name == "com.apple.ResourceFork" {
-		errno = -fuse.ENOTSUP
-		return
-	}
-	if flags == fuse.XATTR_CREATE {
-		if _, exist := nodeObject.XAttr[name]; exist {
-			return -fuse.EEXIST
-		}
-	} else if flags == fuse.XATTR_REPLACE {
-		if _, exist := nodeObject.XAttr[name]; !exist {
-			return -fuse.ENOATTR
-		}
-	}
+// 	if name == "com.apple.ResourceFork" {
+// 		errno = -fuse.ENOTSUP
+// 		return
+// 	}
+// 	if flags == fuse.XATTR_CREATE {
+// 		if _, exist := nodeObject.XAttr[name]; exist {
+// 			return -fuse.EEXIST
+// 		}
+// 	} else if flags == fuse.XATTR_REPLACE {
+// 		if _, exist := nodeObject.XAttr[name]; !exist {
+// 			return -fuse.ENOATTR
+// 		}
+// 	}
 
-	xattr := make([]byte, len(value))
-	copy(xattr, value)
-	nodeObject.XAttr[name] = xattr
+// 	xattr := make([]byte, len(value))
+// 	copy(xattr, value)
+// 	nodeObject.XAttr[name] = xattr
 
-	// dump
-	fs.writeToCache(node, nodeObject, true)
+// 	// dump
+// 	fs.writeToCache(node, nodeObject, true)
 
-	return
-}
+// 	return
+// }
 
-func (fs *AESFS) Getxattr(path string, name string) (errno int, xattr []byte) {
-	var err error
-	defer Trace(path, name)(&err, &errno, &xattr)
+// func (fs *AESFS) Getxattr(path string, name string) (errno int, xattr []byte) {
+// 	var err error
+// 	defer Trace(path, name)(&err, &errno, &xattr)
 
-	var (
-		node       NodeID
-		nodeObject *Node
-	)
-	_, _, node, nodeObject, errno, err = fs.lookupNode(path, INVALID_INO)
-	if errno < 0 || err != nil {
-		if err != nil {
-			errno = -fuse.EIO
-		}
-		return
-	}
-	if node == INVALID_INO {
-		errno = -fuse.ENOENT
-		return
-	}
+// 	var (
+// 		node       NodeID
+// 		nodeObject *Node
+// 	)
+// 	_, _, node, nodeObject, errno, err = fs.lookupNode(path, INVALID_INO)
+// 	if errno < 0 || err != nil {
+// 		if err != nil {
+// 			errno = -fuse.EIO
+// 		}
+// 		return
+// 	}
+// 	if node == INVALID_INO {
+// 		errno = -fuse.ENOENT
+// 		return
+// 	}
 
-	if name == "com.apple.ResourceFork" {
-		errno = -fuse.ENOTSUP
-		return
-	}
-	var exist bool
-	xattr, exist = nodeObject.XAttr[name]
-	if !exist {
-		errno = -fuse.ENOATTR
-		return
-	}
+// 	if name == "com.apple.ResourceFork" {
+// 		errno = -fuse.ENOTSUP
+// 		return
+// 	}
+// 	var exist bool
+// 	xattr, exist = nodeObject.XAttr[name]
+// 	if !exist {
+// 		errno = -fuse.ENOATTR
+// 		return
+// 	}
 
-	return
-}
+// 	return
+// }
 
-func (fs *AESFS) Removexattr(path string, name string) (errno int) {
-	var err error
-	defer Trace(path, name)(&err, &errno)
+// func (fs *AESFS) Removexattr(path string, name string) (errno int) {
+// 	var err error
+// 	defer Trace(path, name)(&err, &errno)
 
-	var (
-		node       NodeID
-		nodeObject *Node
-	)
-	_, _, node, nodeObject, errno, err = fs.lookupNode(path, INVALID_INO)
-	if errno < 0 || err != nil {
-		if err != nil {
-			errno = -fuse.EIO
-		}
-		return
-	}
-	if node == INVALID_INO {
-		errno = -fuse.ENOENT
-		return
-	}
+// 	var (
+// 		node       NodeID
+// 		nodeObject *Node
+// 	)
+// 	_, _, node, nodeObject, errno, err = fs.lookupNode(path, INVALID_INO)
+// 	if errno < 0 || err != nil {
+// 		if err != nil {
+// 			errno = -fuse.EIO
+// 		}
+// 		return
+// 	}
+// 	if node == INVALID_INO {
+// 		errno = -fuse.ENOENT
+// 		return
+// 	}
 
-	if name == "com.apple.ResourceFork" {
-		errno = -fuse.ENOTSUP
-		return
-	}
-	var exist bool
-	_, exist = nodeObject.XAttr[name]
-	if !exist {
-		errno = -fuse.ENOATTR
-		return
-	}
+// 	if name == "com.apple.ResourceFork" {
+// 		errno = -fuse.ENOTSUP
+// 		return
+// 	}
+// 	var exist bool
+// 	_, exist = nodeObject.XAttr[name]
+// 	if !exist {
+// 		errno = -fuse.ENOATTR
+// 		return
+// 	}
 
-	delete(nodeObject.XAttr, name)
+// 	delete(nodeObject.XAttr, name)
 
-	// dump
-	fs.writeToCache(node, nodeObject, true)
+// 	// dump
+// 	fs.writeToCache(node, nodeObject, true)
 
-	return
-}
+// 	return
+// }
 
-func (fs *AESFS) Listxattr(path string, fill func(name string) bool) (errno int) {
-	var err error
-	defer Trace(path)(&err, &errno)
+// func (fs *AESFS) Listxattr(path string, fill func(name string) bool) (errno int) {
+// 	var err error
+// 	defer Trace(path)(&err, &errno)
 
-	var (
-		node       NodeID
-		nodeObject *Node
-	)
-	_, _, node, nodeObject, errno, err = fs.lookupNode(path, INVALID_INO)
-	if errno < 0 || err != nil {
-		if err != nil {
-			errno = -fuse.EIO
-		}
-		return
-	}
-	if node == INVALID_INO {
-		errno = -fuse.ENOENT
-		return
-	}
+// 	var (
+// 		node       NodeID
+// 		nodeObject *Node
+// 	)
+// 	_, _, node, nodeObject, errno, err = fs.lookupNode(path, INVALID_INO)
+// 	if errno < 0 || err != nil {
+// 		if err != nil {
+// 			errno = -fuse.EIO
+// 		}
+// 		return
+// 	}
+// 	if node == INVALID_INO {
+// 		errno = -fuse.ENOENT
+// 		return
+// 	}
 
-	for name := range nodeObject.XAttr {
-		if !fill(name) {
-			errno = -fuse.ERANGE
-			return
-		}
-	}
+// 	for name := range nodeObject.XAttr {
+// 		if !fill(name) {
+// 			errno = -fuse.ERANGE
+// 			return
+// 		}
+// 	}
 
-	return
-}
+// 	return
+// }
 
 func (fs *AESFS) Chflags(path string, flags uint32) (errno int) {
 	var err error
