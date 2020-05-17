@@ -1323,7 +1323,7 @@ func (fs *AESFS) Write(path string, buffer []byte, offset int64, fh uint64) (n i
 		if oldSize < offset {
 			err = af.Truncate(endOffset)
 		} else {
-			err = af.TruncateFillZero(endOffset)
+			// err = af.TruncateFillZero(endOffset)
 		}
 		if err != nil {
 			n = -fuse.EIO
