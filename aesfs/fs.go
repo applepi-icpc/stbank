@@ -746,15 +746,18 @@ func (fs *AESFS) openNode(path string, dir bool) (errno int, err error, fh uint6
 
 		cnt, exist := fs.opencount[node]
 		if !exist {
-			var af *aesrw.AESFile
-			af, err = fs.openActualFile(fs.inoPath(node, "c"), CREATE_AUTO, false)
-			if err != nil {
-				return
+			if !dir {
+				var af *aesrw.AESFile
+				af, err = fs.openActualFile(fs.inoPath(node, "c"), CREATE_AUTO, false)
+				if err != nil {
+					return
+				}
+
+				fs.openedFiles[node] = af
 			}
 
 			fs.opencount[node] = 1
 			fs.openmap[node] = nodeObject
-			fs.openedFiles[node] = af
 		} else {
 			fs.opencount[node] = cnt + 1
 		}
@@ -783,12 +786,15 @@ func (fs *AESFS) closeNode(fh uint64) {
 		delete(fs.opencount, nodeID)
 		delete(fs.openmap, nodeID)
 
-		err := fs.openedFiles[nodeID].Close()
-		if err != nil {
-			log.WithFields(log.Fields{
-				"error":   err,
-				"node_id": nodeID,
-			}).Error("Failed to close content file")
+		_, exist := fs.openedFiles[nodeID]
+		if exist {
+			err := fs.openedFiles[nodeID].Close()
+			if err != nil {
+				log.WithFields(log.Fields{
+					"error":   err,
+					"node_id": nodeID,
+				}).Error("Failed to close content file")
+			}
 		}
 
 		delete(fs.openedFiles, nodeID)
