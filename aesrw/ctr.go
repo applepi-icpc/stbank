@@ -34,7 +34,7 @@ func (c CTR) Add(n int64) CTR {
 
 	res := CTR{}
 	for i := 0; i < BlockSize; i++ {
-		res[i] = byte(resInt[i] % 0xFF)
+		res[i] = byte(resInt[i] & 0xFF)
 	}
 	return res
 }
