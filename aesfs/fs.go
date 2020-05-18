@@ -1417,10 +1417,14 @@ func (fs *AESFS) Readdir(path string, fill Filler, offset int64, fh uint64) (err
 	fill("..", nil, 0)
 
 	for name, child := range nodeObject.Children {
-		childNode, err := fs.getNode(child)
+		var childNode *Node
+		childNode, err = fs.getNode(child)
 		if err != nil {
-			errno = -fuse.EIO
-			return
+			log.WithFields(log.Fields{
+				"name":  name,
+				"error": err,
+			}).Error("Failed to read children")
+			continue
 		}
 
 		stat := statDecorateForGet(childNode.Stat)
