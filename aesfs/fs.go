@@ -1156,6 +1156,14 @@ func (fs *AESFS) Open(path string, flags int) (errno int, fh uint64) {
 	return
 }
 
+func statDecorateForGet(stat fuse.Stat_t) fuse.Stat_t {
+	// make everyone has permission
+	stat.Mode = (stat.Mode & fuse.S_IFMT) | 0777
+	stat.Uid = 0
+	stat.Gid = 0
+	return stat
+}
+
 func (fs *AESFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) (errno int) {
 	var err error
 	defer Trace(path, fh)(&err, &errno)
@@ -1169,7 +1177,8 @@ func (fs *AESFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) (errno int) 
 		return
 	}
 
-	*stat = nodeObject.Stat
+	resStat := statDecorateForGet(nodeObject.Stat)
+	*stat = resStat
 	return
 }
 
@@ -1403,8 +1412,10 @@ func (fs *AESFS) Readdir(path string, fill Filler, offset int64, fh uint64) (err
 		return
 	}
 
-	fill(".", &nodeObject.Stat, 0)
+	stat := statDecorateForGet(nodeObject.Stat)
+	fill(".", &stat, 0)
 	fill("..", nil, 0)
+
 	for name, child := range nodeObject.Children {
 		childNode, err := fs.getNode(child)
 		if err != nil {
@@ -1412,7 +1423,8 @@ func (fs *AESFS) Readdir(path string, fill Filler, offset int64, fh uint64) (err
 			return
 		}
 
-		if !fill(name, &childNode.Stat, 0) {
+		stat := statDecorateForGet(childNode.Stat)
+		if !fill(name, &stat, 0) {
 			break
 		}
 	}
