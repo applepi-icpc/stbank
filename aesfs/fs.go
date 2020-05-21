@@ -81,7 +81,6 @@ type AESFSMeta struct {
 type NodeCache struct {
 	ID        NodeID
 	Node      *Node
-	Dirty     bool
 	LastTouch time.Time
 	Occupied  bool
 }
@@ -96,15 +95,15 @@ type AESFS struct {
 	meta            *AESFSMeta
 	rootDir         string // root dir on actual file system
 
-	openmap     map[NodeID]*Node
 	opencount   map[NodeID]int
 	openedFiles map[NodeID]*aesrw.AESFile
 
 	metaShouldDump bool
 	metaDumpTime   time.Time
 
-	nodeCacheMu sync.Mutex
-	nodeCache   []*NodeCache
+	nodeCacheMu    sync.Mutex
+	dirtyNodeCache []*NodeCache
+	allNodeCache   map[NodeID]*Node
 }
 
 func (fs *AESFS) actualPath(filename string) string {
@@ -348,7 +347,6 @@ func NewAESFS(rootDir string, blockEncryption cipher.Block) (*AESFS, error) {
 		blockEncryption: blockEncryption,
 		meta:            nil,
 		rootDir:         rootDir,
-		openmap:         make(map[int64]*Node),
 		opencount:       make(map[int64]int),
 		openedFiles:     make(map[int64]*aesrw.AESFile),
 	}
@@ -379,10 +377,11 @@ func NewAESFS(rootDir string, blockEncryption cipher.Block) (*AESFS, error) {
 
 	go res.checkMetaDumpLoop()
 
-	res.nodeCache = make([]*NodeCache, CacheSize)
-	for k := range res.nodeCache {
-		res.nodeCache[k] = &NodeCache{}
+	res.dirtyNodeCache = make([]*NodeCache, CacheSize)
+	for k := range res.dirtyNodeCache {
+		res.dirtyNodeCache[k] = &NodeCache{}
 	}
+	res.allNodeCache = make(map[NodeID]*Node)
 
 	go res.scanCacheLoop()
 
@@ -405,9 +404,10 @@ func (fs *AESFS) exitSignalHandler() {
 	fs.nodeCacheMu.Lock()
 	defer fs.nodeCacheMu.Unlock()
 
-	for _, entry := range fs.nodeCache {
-		if entry.Occupied && entry.Dirty {
+	for _, entry := range fs.dirtyNodeCache {
+		if entry.Occupied {
 			fs.writeBackNode(entry)
+			entry.Occupied = false
 		}
 	}
 }
@@ -416,11 +416,9 @@ func (fs *AESFS) findInCache(ino NodeID) *Node {
 	fs.nodeCacheMu.Lock()
 	defer fs.nodeCacheMu.Unlock()
 
-	for _, entry := range fs.nodeCache {
-		if entry.Occupied && entry.ID == ino {
-			entry.LastTouch = time.Now()
-			return entry.Node
-		}
+	node, exist := fs.allNodeCache[ino]
+	if exist {
+		return node
 	}
 
 	return nil
@@ -437,7 +435,7 @@ func (fs *AESFS) writeBackNode(entry *NodeCache) {
 		}).Error("Failed to dump node")
 	} else {
 		log.WithField("id", entry.ID).Info("Node wrote back")
-		entry.Dirty = false
+		entry.Occupied = false
 	}
 }
 
@@ -447,7 +445,7 @@ func (fs *AESFS) findEmptyEntry() (index int) {
 	index = -1
 	earliestLastTouch := time.Now()
 
-	for i, entry := range fs.nodeCache {
+	for i, entry := range fs.dirtyNodeCache {
 		if !entry.Occupied {
 			return i
 		}
@@ -460,10 +458,9 @@ func (fs *AESFS) findEmptyEntry() (index int) {
 	if index == -1 {
 		panic("not evicted anything")
 	}
-	entry := fs.nodeCache[index]
-	if entry.Dirty {
-		fs.writeBackNode(entry)
-	}
+	entry := fs.dirtyNodeCache[index]
+	fs.writeBackNode(entry)
+	entry.Occupied = false
 
 	return
 }
@@ -472,10 +469,14 @@ func (fs *AESFS) writeToCache(ino NodeID, node *Node, dirty bool) {
 	fs.nodeCacheMu.Lock()
 	defer fs.nodeCacheMu.Unlock()
 
-	for _, entry := range fs.nodeCache {
+	fs.allNodeCache[ino] = node
+	if !dirty {
+		return
+	}
+
+	for _, entry := range fs.dirtyNodeCache {
 		if entry.Occupied && entry.ID == ino {
 			entry.Node = node
-			entry.Dirty = dirty
 			entry.LastTouch = time.Now()
 			return
 		}
@@ -483,10 +484,9 @@ func (fs *AESFS) writeToCache(ino NodeID, node *Node, dirty bool) {
 
 	index := fs.findEmptyEntry()
 
-	entry := fs.nodeCache[index]
+	entry := fs.dirtyNodeCache[index]
 	entry.ID = ino
 	entry.Node = node
-	entry.Dirty = dirty
 	entry.LastTouch = time.Now()
 	entry.Occupied = true
 }
@@ -501,8 +501,8 @@ func (fs *AESFS) scanCacheLoop() {
 			fs.nodeCacheMu.Lock()
 			defer fs.nodeCacheMu.Unlock()
 
-			for _, entry := range fs.nodeCache {
-				if entry.Occupied && entry.Dirty && entry.LastTouch.Before(bar) {
+			for _, entry := range fs.dirtyNodeCache {
+				if entry.Occupied && entry.LastTouch.Before(bar) {
 					fs.writeBackNode(entry)
 				}
 			}
@@ -511,14 +511,6 @@ func (fs *AESFS) scanCacheLoop() {
 }
 
 func (fs *AESFS) getNode(ino NodeID) (*Node, error) {
-	fs.mu.Lock()
-	node, exist := fs.openmap[ino]
-	if exist {
-		fs.mu.Unlock()
-		return node, nil
-	}
-	fs.mu.Unlock()
-
 	cachedNode := fs.findInCache(ino)
 	if cachedNode != nil {
 		return cachedNode, nil
@@ -757,7 +749,6 @@ func (fs *AESFS) openNode(path string, dir bool) (errno int, err error, fh uint6
 			}
 
 			fs.opencount[node] = 1
-			fs.openmap[node] = nodeObject
 		} else {
 			fs.opencount[node] = cnt + 1
 		}
@@ -784,7 +775,6 @@ func (fs *AESFS) closeNode(fh uint64) {
 	if cnt <= 1 {
 		// remove node
 		delete(fs.opencount, nodeID)
-		delete(fs.openmap, nodeID)
 
 		_, exist := fs.openedFiles[nodeID]
 		if exist {
@@ -1048,34 +1038,34 @@ func (fs *AESFS) Rename(oldpath string, newpath string) (errno int) {
 	return
 }
 
-func (fs *AESFS) Chmod(path string, mode uint32) (errno int) {
-	var err error
-	defer Trace(path, mode)(&err, &errno)
+// func (fs *AESFS) Chmod(path string, mode uint32) (errno int) {
+// 	var err error
+// 	defer Trace(path, mode)(&err, &errno)
 
-	var (
-		node       NodeID
-		nodeObject *Node
-	)
-	_, _, node, nodeObject, errno, err = fs.lookupNode(path, INVALID_INO)
-	if errno < 0 || err != nil {
-		if err != nil {
-			errno = -fuse.EIO
-		}
-		return
-	}
-	if node == INVALID_INO {
-		errno = -fuse.ENOENT
-		return
-	}
+// 	var (
+// 		node       NodeID
+// 		nodeObject *Node
+// 	)
+// 	_, _, node, nodeObject, errno, err = fs.lookupNode(path, INVALID_INO)
+// 	if errno < 0 || err != nil {
+// 		if err != nil {
+// 			errno = -fuse.EIO
+// 		}
+// 		return
+// 	}
+// 	if node == INVALID_INO {
+// 		errno = -fuse.ENOENT
+// 		return
+// 	}
 
-	nodeObject.Stat.Mode = (nodeObject.Stat.Mode & fuse.S_IFMT) | (mode & 07777)
-	nodeObject.Stat.Ctim = fuse.Now()
+// 	nodeObject.Stat.Mode = (nodeObject.Stat.Mode & fuse.S_IFMT) | (mode & 07777)
+// 	nodeObject.Stat.Ctim = fuse.Now()
 
-	// dump
-	fs.writeToCache(node, nodeObject, true)
+// 	// dump
+// 	fs.writeToCache(node, nodeObject, true)
 
-	return
-}
+// 	return
+// }
 
 func (fs *AESFS) Chown(path string, uid uint32, gid uint32) (errno int) {
 	var err error
@@ -1287,12 +1277,6 @@ func (fs *AESFS) Read(path string, buffer []byte, offset int64, fh uint64) (n in
 		n = -fuse.EIO
 		return
 	}
-
-	// now := fuse.Now()
-	// nodeObject.Stat.Atim = now
-
-	// dump
-	// fs.writeToCache(node, nodeObject, true)
 
 	return
 }

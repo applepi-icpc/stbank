@@ -21,11 +21,13 @@ func main() {
 		err      error
 	)
 
+	log.SetLevel(log.WarnLevel)
+
 	if len(args) >= 4 && args[1][0] != '-' && args[2][0] != '-' && args[len(args)-1][0] != '-' {
 		rawRoot := args[1]
 		root, err = filepath.Abs(rawRoot)
 		if err != nil {
-			log.Fatal("Failed to get path from %s: %s", rawRoot, err.Error())
+			log.Fatalf("Failed to get path from %s: %s", rawRoot, err.Error())
 		}
 		password = args[2]
 		args = append(args[3:])
@@ -37,12 +39,12 @@ func main() {
 	aesKey := passwordSHA256[:]
 	block, err := aes.NewCipher(aesKey)
 	if err != nil {
-		log.Fatal("Failed to generate AES key: %s", err.Error())
+		log.Fatalf("Failed to generate AES key: %s", err.Error())
 	}
 
 	fs, err := aesfs.NewAESFS(root, block)
 	if err != nil {
-		log.Fatal("Failed to init FS: %s", err.Error())
+		log.Fatalf("Failed to init FS: %s", err.Error())
 	}
 
 	host := fuse.NewFileSystemHost(fs)

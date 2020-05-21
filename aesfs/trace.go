@@ -12,7 +12,7 @@ import (
 
 var ENABLE_TRACE = true
 
-func traceJoin(deref bool, vals []interface{}) string {
+func traceJoin(deref bool, vals ...interface{}) string {
 	res := []string{}
 	for _, v := range vals {
 		if deref {
@@ -84,9 +84,9 @@ func traceJoin(deref bool, vals []interface{}) string {
 	return strings.Join(res, ", ")
 }
 
-func Trace(params ...interface{}) func(vals ...interface{}) {
+func Trace(params ...interface{}) func(err *error, errno *int, vals ...interface{}) {
 	if !ENABLE_TRACE {
-		return func(vals ...interface{}) {}
+		return func(err *error, errno *int, vals ...interface{}) {}
 	}
 
 	// get function name
@@ -101,32 +101,30 @@ func Trace(params ...interface{}) func(vals ...interface{}) {
 
 	uid, gid, _ := fuse.Getcontext()
 	prefix := fmt.Sprintf("[u=%d,g=%d]", uid, gid)
-	args := traceJoin(false, params)
+	args := traceJoin(false, params...)
 
-	// log.Infof("%v I %v(%v)", prefix, funcName, args)
-
-	return func(vals ...interface{}) {
+	return func(err *error, errno *int, vals ...interface{}) {
 		result := ""
 		recovered := recover()
 
+		realVals := append([]interface{}{err, errno}, vals...)
 		if recovered != nil {
 			result = fmt.Sprintf("!PANIC:%v", recovered)
 		} else {
-			if len(vals) == 1 {
-				result = fmt.Sprintf("%v", traceJoin(true, vals))
-			} else {
-				result = fmt.Sprintf("(%v)", traceJoin(true, vals))
-			}
+			result = fmt.Sprintf("(%v)", traceJoin(true, realVals...))
 		}
 
 		form := "%v %v(%v) = %v"
 		if recovered != nil {
 			log.Errorf(form, prefix, funcName, args, result)
 			log.Error("Stack trace:\n" + string(debug.Stack()))
-
 			panic(recovered)
 		} else {
-			log.Infof(form, prefix, funcName, args, result)
+			if *err != nil || *errno < 0 {
+				log.Warnf(form, prefix, funcName, args, result)
+			} else {
+				log.Infof(form, prefix, funcName, args, result)
+			}
 		}
 	}
 }
